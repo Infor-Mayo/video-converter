@@ -3,10 +3,8 @@ import subprocess
 import threading
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
-import os
-import threading
-import subprocess
 import re
+import ctypes
 
 
 # Inicializar CustomTkinter
@@ -17,6 +15,11 @@ class VideoConverterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Video Converter Pro")
+
+        # --- Set Taskbar Icon (Windows specific) ---
+        if os.name == 'nt':
+            myappid = 'Infor-Mayo.VideoConverter.1.0' 
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         self.geometry("700x750")
         self.minsize(550, 500) # Establecer tamaño mínimo
 
@@ -26,14 +29,16 @@ class VideoConverterApp(ctk.CTk):
             icon_path = os.path.join(base_path, "img", "app_icon.ico")
             if os.path.exists(icon_path):
                 self.wm_iconbitmap(icon_path)
+                self.iconbitmap(icon_path) # Set icon for taskbar
             else:
                 # This is just a fallback in case the .ico is missing
                 print(f"Icon file 'app_icon.ico' not found.")
         except Exception as e:
             print(f"Error setting icon: {e}")
 
-        self.file_paths = []
-        self.output_formats = ["auto", "mp4", "avi", "mkv", "mov", "flv", "wmv", "webm", "3gp", "mpg", "mpeg", "m4v", "ts"]
+        self.files_info = [] # Lista de dicts: {'path': str, 'status': str}
+        self.file_widgets = {} # Dict para almacenar los widgets de estado por ruta
+        self.output_formats = ["auto", "mp4", "avi", "mkv", "mov", "flv", "wmv", "webm", "3gp", "mpg", "mpeg", "m4v", "ts", "personalizado"]
         self.is_compact = None
         self.file_list_visible = True
         self.config_visible = False
@@ -54,17 +59,6 @@ class VideoConverterApp(ctk.CTk):
         self.title_label = ctk.CTkLabel(self.container, text="Video Converter Pro", font=self.font_title)
         self.title_label.grid(row=0, column=0, padx=10, pady=(10, 20), sticky="ew")
 
-        # --- MARCO DE SELECCIÓN DE ARCHIVOS ---
-        self.selection_frame = ctk.CTkFrame(self.container, fg_color="transparent")
-        self.selection_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
-        self.selection_frame.grid_columnconfigure((0, 1), weight=1)
-
-        self.select_file_button = ctk.CTkButton(self.selection_frame, text="Seleccionar Archivos", command=self.select_files, font=self.font_button, height=40)
-        self.select_file_button.grid(row=1, column=0, padx=(0, 5), pady=5, sticky="ew")
-
-        self.select_folder_button = ctk.CTkButton(self.selection_frame, text="Seleccionar Carpeta", command=self.select_folder, font=self.font_button, height=40)
-        self.select_folder_button.grid(row=1, column=1, padx=(5, 0), pady=5, sticky="ew")
-        
         # --- CONTENEDOR DE LA LISTA DE ARCHIVOS (CON INTERRUPTOR) ---
         self.file_list_container = ctk.CTkFrame(self.container, fg_color="transparent")
         self.file_list_container.grid_columnconfigure(0, weight=1)
@@ -84,7 +78,7 @@ class VideoConverterApp(ctk.CTk):
         self.output_format_label = ctk.CTkLabel(self.config_frame, text="Formato de salida:", font=self.font_label)
         self.output_format_label.grid(row=0, column=0, padx=(0,5), pady=5, sticky="w")
 
-        self.output_format_combobox = ctk.CTkComboBox(self.config_frame, values=self.output_formats, font=self.font_label)
+        self.output_format_combobox = ctk.CTkComboBox(self.config_frame, values=self.output_formats, font=self.font_label, command=self.on_format_selected)
         self.output_format_combobox.grid(row=0, column=0, padx=(120,0), pady=5, sticky="ew")
 
         self.add_format_entry = ctk.CTkEntry(self.config_frame, placeholder_text="Añadir formato", font=self.font_label)
@@ -92,6 +86,10 @@ class VideoConverterApp(ctk.CTk):
 
         self.add_format_button = ctk.CTkButton(self.config_frame, text="Añadir", command=self.add_new_format, font=self.font_button, width=60)
         self.add_format_button.grid(row=1, column=1, padx=(5,0), pady=(5,0), sticky="e")
+
+        # Ocultar widgets de formato personalizado inicialmente
+        self.add_format_entry.grid_forget()
+        self.add_format_button.grid_forget()
 
         # --- OPCIONES AVANZADAS ---
         self.advanced_toggle = ctk.CTkCheckBox(self.container, text="Opciones avanzadas", command=self.toggle_advanced, font=self.font_label)
@@ -119,7 +117,16 @@ class VideoConverterApp(ctk.CTk):
         self.total_percent = ctk.CTkLabel(self.progress_frame, text="0%", font=self.font_label)
 
         # --- ESTADO INICIAL Y RESPONSIVIDAD ---
-        self.reset_ui_to_initial_state()
+        self.update_file_list_ui() # Mostrar la lista vacía al inicio
+
+        # --- Botón Flotante de Acción (FAB) ---
+        # Clic izquierdo para archivos, clic derecho para carpetas
+        self.fab_button = ctk.CTkButton(self, text="+", width=50, height=50, corner_radius=25, font=ctk.CTkFont(size=24, weight="bold"), fg_color="#2FA572", hover_color="#237A54", text_color="#FFFFFF")
+        self.fab_button.place(relx=1.0, rely=1.0, x=-20, y=-20, anchor="se")
+        self.fab_button.bind("<Button-1>", lambda e: self.select_files())
+        self.fab_button.bind("<Button-3>", lambda e: self.select_folder())
+
+        # Bind resize event
         self.bind("<Configure>", self.on_resize)
         self.on_resize() # Llamada inicial para establecer el layout correcto
 
@@ -150,10 +157,29 @@ class VideoConverterApp(ctk.CTk):
             self.output_dir_entry.delete(0, ctk.END)
             self.output_dir_entry.insert(0, folder)
 
+    def get_status_icon(self, status):
+        icons = {
+            "queue": "⏳",
+            "processing": "⚙️",
+            "done": "✅",
+            "error": "❌"
+        }
+        return icons.get(status, "")
+
+    def update_file_status(self, file_path, new_status):
+        for info in self.files_info:
+            if info['path'] == file_path:
+                info['status'] = new_status
+                break
+        if file_path in self.file_widgets:
+            self.file_widgets[file_path].configure(text=self.get_status_icon(new_status))
+            self.update_idletasks()
+
     def select_files(self):
         files = filedialog.askopenfilenames(filetypes=[("Video files", "*.*")])
         if not files: return
-        self.file_paths.extend(files)
+        for f in files:
+            self.files_info.append({'path': f, 'status': 'queue'})
         self.update_file_list_ui()
         self.show_config_if_needed()
 
@@ -166,24 +192,35 @@ class VideoConverterApp(ctk.CTk):
                 if file.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv')):
                     added_files.append(os.path.join(root, file))
         if added_files:
-            self.file_paths.extend(added_files)
+            for f in added_files:
+                self.files_info.append({'path': f, 'status': 'queue'})
             self.update_file_list_ui()
             self.show_config_if_needed()
 
     def update_file_list_ui(self):
         for widget in self.file_list_frame.winfo_children():
             widget.destroy()
-        if not self.file_paths:
+        self.file_widgets = {}
+
+        if not self.files_info:
             label = ctk.CTkLabel(self.file_list_frame, text="No hay archivos seleccionados", font=self.font_label, text_color="gray")
             label.pack(pady=10)
         else:
-            for i, file_path in enumerate(self.file_paths):
-                label_text = f"{i+1}. {os.path.basename(file_path)}"
-                label = ctk.CTkLabel(self.file_list_frame, text=label_text, font=self.font_label, anchor="w")
-                label.pack(fill="x", padx=5, pady=2)
+            for info in self.files_info:
+                file_path = info['path']
+                item_frame = ctk.CTkFrame(self.file_list_frame, fg_color="transparent")
+                item_frame.pack(fill="x", padx=5, pady=2)
+
+                status_label = ctk.CTkLabel(item_frame, text=self.get_status_icon(info['status']), font=self.font_label, width=25)
+                status_label.pack(side="left", padx=(0, 5))
+
+                filename_label = ctk.CTkLabel(item_frame, text=os.path.basename(file_path), font=self.font_label, anchor="w")
+                filename_label.pack(side="left", fill="x", expand=True)
+
+                self.file_widgets[file_path] = status_label
 
     def show_config_if_needed(self):
-        if self.file_paths and not self.config_visible:
+        if self.files_info and not self.config_visible:
             self.file_list_container.grid(row=2, column=0, padx=10, pady=10, sticky="nsew")
             self.config_frame.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
             self.advanced_toggle.grid(row=4, column=0, padx=10, pady=(10,0), sticky="w")
@@ -191,11 +228,21 @@ class VideoConverterApp(ctk.CTk):
             self.config_visible = True
 
     def set_controls_state(self, state):
-        for control in [self.select_file_button, self.select_folder_button, self.output_format_combobox, self.add_format_entry, self.add_format_button, self.advanced_toggle, self.convert_button, self.file_list_switch]:
+        for control in [self.fab_button, self.output_format_combobox, self.add_format_entry, self.add_format_button, self.advanced_toggle, self.convert_button]:
             control.configure(state=state)
         if self.advanced_visible:
             self.browse_output_button.configure(state=state)
             self.output_dir_entry.configure(state=state)
+
+
+
+    def on_format_selected(self, selected_format):
+        if selected_format == "personalizado":
+            self.add_format_entry.grid(row=1, column=0, padx=0, pady=(5,0), sticky="ew")
+            self.add_format_button.grid(row=1, column=1, padx=(5,0), pady=(5,0), sticky="e")
+        else:
+            self.add_format_entry.grid_forget()
+            self.add_format_button.grid_forget()
 
     def on_resize(self, event=None):
         width = self.winfo_width()
@@ -204,18 +251,11 @@ class VideoConverterApp(ctk.CTk):
         if self.is_compact == is_compact_now: return
         self.is_compact = is_compact_now
         
-        # Reconfigurar marco de selección
-        self.select_folder_button.grid(row=2 if self.is_compact else 1, column=0 if self.is_compact else 1, sticky="ew", padx=0 if self.is_compact else (5,0), pady=(0,5) if self.is_compact else 5)
-        self.select_file_button.grid_configure(padx=(0,0) if self.is_compact else (0,5))
-
-        # Reconfigurar marco de agregar formato
-        if self.config_visible:
-            self.add_format_entry.grid(columnspan=2 if self.is_compact else 1)
-            self.add_format_button.grid(column=1 if not self.is_compact else 2)
-            self.output_format_combobox.grid_configure(columnspan=2 if self.is_compact else 1)
+        # La lógica de redimensionamiento para el marco de formato personalizado ya no es necesaria aquí.
 
     def reset_ui_to_initial_state(self):
-        self.file_paths = []
+        self.files_info = []
+        self.file_widgets = {}
         self.update_file_list_ui()
 
         self.file_list_container.grid_forget()
@@ -228,6 +268,9 @@ class VideoConverterApp(ctk.CTk):
 
         self.convert_button.grid_forget()
         self.config_visible = False
+        self.add_format_entry.grid_forget()
+        self.add_format_button.grid_forget()
+        self.output_format_combobox.set("auto")
 
         self.progress_frame.grid_forget()
         
@@ -243,7 +286,7 @@ class VideoConverterApp(ctk.CTk):
         thread.start()
 
     def convert_videos(self):
-        if not self.file_paths:
+        if not self.files_info:
             messagebox.showwarning("Sin archivos", "Por favor, selecciona al menos un archivo.")
             return
 
@@ -259,10 +302,13 @@ class VideoConverterApp(ctk.CTk):
         try:
             output_format = self.output_format_combobox.get().strip().lower()
             output_dir = self.output_dir_entry.get().strip()
-            total_files = len(self.file_paths)
+            total_files = len(self.files_info)
             self.total_progress_bar.set(0)
 
-            for i, file_path in enumerate(self.file_paths):
+            for i, info in enumerate(self.files_info):
+                file_path = info['path']
+                self.update_file_status(file_path, "processing")
+
                 self.progress_bar.set(0)
                 self.percent_label.configure(text="0%")
                 self.progress_label.configure(text=f"Archivo: {os.path.basename(file_path)}")
@@ -272,7 +318,6 @@ class VideoConverterApp(ctk.CTk):
                 output_file = os.path.join(output_dir or os.path.dirname(file_path), os.path.splitext(os.path.basename(file_path))[0] + out_ext)
 
                 try:
-                    # Este try/except interno maneja errores para un solo archivo
                     startupinfo = subprocess.STARTUPINFO() if os.name == 'nt' else None
                     if os.name == 'nt':
                         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -293,26 +338,32 @@ class VideoConverterApp(ctk.CTk):
                             progress = ((h * 3600 + m * 60 + s + ms / 100) / duration)
                             self.progress_bar.set(progress)
                             self.percent_label.configure(text=f"{int(progress*100)}%")
+
+                            # Actualizar progreso total en tiempo real
+                            total_progress = (i + progress) / total_files
+                            self.total_progress_bar.set(total_progress)
+                            self.total_percent.configure(text=f"{int(total_progress * 100)}%")
+                            
                             self.update_idletasks()
                     process.wait()
                     if process.returncode != 0:
                         raise Exception(f"FFmpeg exited with code {process.returncode}")
+                    
+                    self.update_file_status(file_path, "done")
 
                 except Exception as e:
+                    self.update_file_status(file_path, "error")
                     messagebox.showerror("Error de conversión", f"No se pudo convertir {os.path.basename(file_path)}\nError: {e}")
-                    return # Salir de la función, el bloque finally se ejecutará
+                    return
 
-                # Actualizar progreso total después de una conversión exitosa
                 total_progress = (i + 1) / total_files
                 self.total_progress_bar.set(total_progress)
                 self.total_percent.configure(text=f"{int(total_progress * 100)}%")
                 self.update_idletasks()
 
-            # Si el bucle se completa sin retornar por un error
             messagebox.showinfo("Conversión completada", "Todos los videos han sido convertidos exitosamente.")
 
         finally:
-            # Esto siempre se ejecutará, haya habido un error o no
             self.reset_ui_to_initial_state()
 
 if __name__ == "__main__":
